@@ -1,0 +1,17 @@
+{
+  "name": "asa-project",
+  "version": "1.0.0",
+  "description": "project for Autonomous Software Agent course",
+  "license": "UNLICENSED",
+  "author": "Mattia Santaniello, Giulia Modenese",
+  "type": "module",
+  "main": "main.js",
+  "scripts": {
+    "start": "node main.js",
+    "test": "npm test"
+  },
+  "dependencies": {
+    "@unitn-asa/deliveroo-js-sdk": "^1.3.5",
+    "dotenv": "^17.4.2"
+  }
+}
