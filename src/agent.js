@@ -1,242 +1,184 @@
-import * as dist from './distance.js'
-import { DjsConnect, DjsClientSocket } from "@unitn-asa/deliveroo-js-sdk/client";
-import "dotenv/config"
+import { DjsConnect } from '@unitn-asa/deliveroo-js-sdk/client';
+import { Beliefs } from './beliefs.js';
+import { findPath } from './pathfinding.js';
+import { chooseTileToExplore } from './exploration.js';
+import { closest, manhattanDistance, sleep } from './utils.js';
+import {
+  STEP_PAUSE_MS, RETRY_PAUSE_MS, IDLE_PAUSE_MS,
+  MAX_MOVE_FAILS, UNREACHABLE_COOLDOWN_MS,
+} from './config.js';
 
-let CellTypes = {
-  WALL: 0,
-  NORMAL: 3,
-  GREEN: 1,
-  RED: 2
-}
-
-export class Agent{
-
-  constructor(){
+export class Agent {
+  constructor() {
     this.socket = DjsConnect();
-    this.selectedParcel = undefined;
-    this.target = undefined;
+    this.beliefs = new Beliefs();
 
-    this.map = new Map();
-    this.goal = new Map();
-    this.deliver = new Map();
+    this.socket.onConfig((config) => this.beliefs.updateConfig(config, STEP_PAUSE_MS));
+    this.socket.onMap((width, height, tiles) => tiles.forEach((t) => this.beliefs.setTile(t)));
+    this.socket.onTile((tile) => this.beliefs.setTile(tile));
+    this.socket.onYou((you) => this.beliefs.updateMe(you));
+    this.socket.onSensing((sensing) => this.beliefs.updateSensing(sensing));
+  }
 
-    this.knownParcels = new Map();
-    this.knownAgents = new Map();
-    this.control = false;
-    this.myPos = {};    
-
-    this.socket.onTile( ({x, y, type}) => {
-      const key = `${x}_${y}`;
-      this.map.set(key, {x, y, type});
-      if(type === CellTypes.RED)
-        this.deliver.set(key, {x, y, type});
-      else if(type === CellTypes.GREEN)
-        this.goal.set(key, {x, y, type});
-    });
-
-    this.socket.onMap((width, height, tiles) => {
-
-      tiles.forEach((tile) => {
-        let x = tile.x;
-        let y = tile.y;
-        let key = `${tile.x}_${tile.y}`;
-        let type = Number(tile.type);
-
-        this.map.set(key, {x, y, type});
-        if(type === CellTypes.RED)
-          this.deliver.set(key, {x, y, type});
-        else if(type === CellTypes.GREEN)
-          this.goal.set(key, {x, y, type});
-      })
-    });
-
-
-    this.socket.onYou(async (initInfo) => {
-     this.myPos = initInfo;
-     //console.log("[INFO] initialized agent with info: ", this.myPos);
-    });
-
-    this.socket.onSensing(async (sensing) => {
-      if (this.control) return;
-      this.control = true;
-
-      try {
-        for (let p of sensing.parcels) {
-          if (!this.knownParcels.has(p.id)) {
-            this.knownParcels.set(p.id, p);
-          } else {
-            let selectedParcel = this.knownParcels.get(p.id);
-            if (!(selectedParcel.x === p.x && selectedParcel.y === p.y)) {
-              this.knownParcels.set(p.id, p);
-            }
-          }
-        }
-
-        for (let a of sensing.agents) {
-          if (!this.knownAgents.has(a.id)) {
-            this.knownAgents.set(a.id, a);
-          } else {
-            let selectedAgent = this.knownAgents.get(a.id);
-            if (!(selectedAgent.x === a.x && selectedAgent.y === a.y)) {
-              this.knownAgents.set(a.id, a);
-            }
-          }
-        }
-      } finally {
-        // Ensures control is always released even if an error is thrown
-        this.control = false; 
+  async run() {
+    while (true) {
+      if (!this.beliefs.hasPosition()) {
+        await sleep(IDLE_PAUSE_MS);
+        continue;
       }
-    });
-  }
 
-  /* A* algorithm to find the best path to reach the destination */
+      if (this.beliefs.carried.size > 0) {
+        await this.deliver();
+        continue;
+      }
 
-  findPath(targetX, targetY) {
-    const walkable = (key) => {
-      const t = this.map.get(key);
-      return t !== undefined && t.type !== CellTypes.WALL;
-    };
-
-    // also refuse to plan into a wall target
-    if (!walkable(`${targetX}_${targetY}`)) return null;
-
-    let queue = [{ x: this.myPos.x, y: this.myPos.y, path: [] }];
-    let visited = new Set();
-
-    while (queue.length > 0) {
-      let cell = queue.shift();
-      let cellKey = `${cell.x}_${cell.y}`;
-
-      if (cell.x === targetX && cell.y === targetY) return cell.path;
-      if (visited.has(cellKey)) continue;
-      visited.add(cellKey);
-
-      const upKey    = `${cell.x}_${cell.y + 1}`;
-      const downKey  = `${cell.x}_${cell.y - 1}`;
-      const leftKey  = `${cell.x - 1}_${cell.y}`;
-      const rightKey = `${cell.x + 1}_${cell.y}`;
-
-      if (walkable(leftKey)  && !visited.has(leftKey))  queue.push({ x: cell.x - 1, y: cell.y,     path: cell.path.concat('left')  });
-      if (walkable(rightKey) && !visited.has(rightKey)) queue.push({ x: cell.x + 1, y: cell.y,     path: cell.path.concat('right') });
-      if (walkable(upKey)    && !visited.has(upKey))    queue.push({ x: cell.x,     y: cell.y + 1, path: cell.path.concat('up')    });
-      if (walkable(downKey)  && !visited.has(downKey))  queue.push({ x: cell.x,     y: cell.y - 1, path: cell.path.concat('down')  });
+      const parcel = this.bestParcelToCollect();
+      if (parcel) await this.collect(parcel);
+      else await this.explore();
     }
-    return null;
   }
 
-  /**
-   * Executes a single step movement safely awaiting server confirmation.
-   */
+  isAt(target) {
+    const { me } = this.beliefs;
+    return Math.round(me.x) === target.x && Math.round(me.y) === target.y;
+  }
 
-  async stepTowards(targetX, targetY) {
-    if (this.myPos.x === undefined || this.myPos.y === undefined) return false;
-
-    const path = this.findPath(targetX, targetY);
+  /* Walk to `target`; stops early (returning false) if shouldAbort() becomes
+   * true, if there is no path or if a move fails. */
+  async moveTo(target, shouldAbort = () => false) {
+    const path = findPath(this.beliefs, this.beliefs.me, target);
     if (!path) {
-      console.warn('[WARN] no path to', targetX, targetY);
-      return false;                       // ← caller must react, not spin
+      console.warn('[WARN] no path to', target.x, target.y);
+      return false;
     }
 
-    for (const movement of path) {
-      const newPos = await this.socket.emitMove(movement);
-      if (!newPos || newPos.x === undefined) {
-        console.warn('[WARN] move failed, aborting path');
-        return false;                     // wall/agent in the way → re-plan
+    for (const direction of path) {
+      if (shouldAbort()) return false;
+      let position;
+      try {
+        position = await this.socket.emitMove(direction);
+      } catch {
+        position = false;   // ack timeout
       }
-      this.myPos.x = newPos.x;
-      this.myPos.y = newPos.y;
-      await new Promise(r => setTimeout(r, 500));
+      if (!position) {
+        console.warn('[WARN] move', direction, 'failed');
+        return false;
+      }
+      this.beliefs.me.x = position.x;
+      this.beliefs.me.y = position.y;
+      await sleep(STEP_PAUSE_MS);
     }
     return true;
   }
 
-  async runAgentLoop() {
-    let carrying = null;
+  /* Free parcel whose reward is still positive once picked up and delivered:
+   *   value = R - stepCost · (d(me, parcel) + d(parcel, nearest delivery)) */
+  bestParcelToCollect() {
+    const { beliefs } = this;
+    const deliveryTiles = [...beliefs.deliveryTiles.values()];
+    if (deliveryTiles.length === 0) return undefined;
 
-    while (true) {
-      if (this.myPos.x === undefined || this.myPos.y === undefined) {
-        await new Promise((resolve) => setTimeout(resolve, 200));
-        continue;
+    const now = Date.now();
+    let best, bestValue = 0;
+    for (const parcel of beliefs.parcels.values()) {
+      const delivery = closest(parcel, deliveryTiles);
+      const steps = manhattanDistance(beliefs.me, parcel) + manhattanDistance(parcel, delivery);
+      const value = beliefs.estimatedReward(parcel, now) - beliefs.stepCost * steps;
+      if (value > bestValue) { best = parcel; bestValue = value; }
+    }
+    return best;
+  }
+
+  async collect(parcel) {
+    const target = { x: Math.round(parcel.x), y: Math.round(parcel.y) };
+    console.debug('[INFO] collecting parcel', parcel.id, 'at', target.x, target.y);
+
+    const parcelGone = () => !this.beliefs.parcels.has(parcel.id);
+    if (!this.isAt(target)) {
+      const arrived = await this.moveTo(target, parcelGone);
+      if (!arrived) {
+        if (!parcelGone()) await sleep(RETRY_PAUSE_MS);
+        return;
       }
+    }
 
-      // 1. If carrying a parcel, navigate to the nearest deliver tile
-      if (carrying) {
-        let deliveryTiles = Array.from(this.deliver.values());
+    let picked = [];
+    try {
+      picked = (await this.socket.emitPickup()) ?? [];
+    } catch { /* ack timeout: treat as nothing picked */ }
 
-        if (deliveryTiles.length === 0) {
-          await new Promise((resolve) => setTimeout(resolve, 300));
-          continue;
-        }
-
-        let nearestDelivery = deliveryTiles.reduce((closest, tile) => {
-          let d = Math.abs(tile.x - this.myPos.x) + Math.abs(tile.y - this.myPos.y);
-          return d < closest.dist ? { tile, dist: d } : closest;
-        }, { tile: deliveryTiles[0], dist: Infinity }).tile;
-
-        if (this.myPos.x === nearestDelivery.x && this.myPos.y === nearestDelivery.y) {
-          await this.socket.emitPutdown();
-          this.knownParcels.delete(carrying);
-          carrying = null;
-        } else {
-          console.debug("[INFO] carrying parcel");
-          let ok = await this.stepTowards(nearestDelivery.x, nearestDelivery.y);
-          if(!ok){
-            console.log("got stuck while trying to go to the delivery tile")
-          }
-        }
-      } 
-      // 2. Otherwise, navigate to the nearest goal tile to pick up a parcel
-      else {
-        let goalTiles = Array.from(this.goal.values());
-
-        if (goalTiles.length === 0) {
-          await new Promise((resolve) => setTimeout(resolve, 300));
-          continue;
-        }
-
-        let nearestGoal = goalTiles.reduce((closest, tile) => {
-          let d = dist.manhattanDistance(tile, this.myPos);
-          return d < closest.dist ? { tile, dist: d } : closest;
-        }, { tile: goalTiles[0], dist: Infinity }).tile;
-
-        if (this.myPos.x === nearestGoal.x && this.myPos.y === nearestGoal.y) {
-          let iterParcels = Array.from(this.knownParcels.values())
-          let parcel = iterParcels.reduce((closest, parcel) => {
-            let d = dist.manhattanDistance(parcel, this.myPos);
-            return d < closest.dist ? { parcel, dist: d} : closest;
-          },{ parcel: iterParcels[0], dist: Infinity}).parcel;
-
-          if(parcel !== undefined){
-            await this.stepTowards(parcel.x, parcel.y);
-            console.debug("[DEBUG] parcel: ", parcel)
-            if(parcel){
-              await this.socket.emitPickup();
-              carrying = parcel.id;
-            }
-          }
-        } else {
-          console.debug("[INFO] navigating goal tile");
-
-          //console.debug("[DEBUG] nearestGoal: ", nearestGoal, " myPos: ", this.myPos);
-          let ok = await this.stepTowards(nearestGoal.x, nearestGoal.y);
-          if(!ok){
-            console.log("got stuck while trying to go to the goal tile")
-          }
-        }
-      }
+    if (picked.length === 0) {
+      console.log('[WARN] nothing picked up at', target.x, target.y);
+      this.beliefs.parcels.delete(parcel.id);
+      return;
+    }
+    // The pickup ack carries no parcel ids (only xy/reward/carriedBy), so record
+    // the parcels we believed were on this tile; sensing confirms them later.
+    const pickedIds = [parcel.id];
+    for (const [id, p] of this.beliefs.parcels) {
+      if (Math.round(p.x) === target.x && Math.round(p.y) === target.y) pickedIds.push(id);
+    }
+    for (const id of pickedIds) {
+      this.beliefs.carried.add(id);
+      this.beliefs.parcels.delete(id);
     }
   }
 
+  async deliver() {
+    const { beliefs } = this;
+    const unreachable = new Set();
+    const nothingCarried = () => beliefs.carried.size === 0;
+    let target, fails = 0;
 
-  explore(){
-   
+    while (!nothingCarried()) {
+      if (!target) {
+        const candidates = [...beliefs.deliveryTiles.values()]
+          .filter((t) => !unreachable.has(t));
+        target = closest(beliefs.me, candidates);
+        fails = 0;
+        if (!target) {
+          console.log('[WARN] no reachable delivery tile, retrying later');
+          await sleep(IDLE_PAUSE_MS);
+          return;
+        }
+        console.debug('[INFO] delivering to', target.x, target.y);
+      }
+
+      if (this.isAt(target)) {
+        let dropped = [];
+        try {
+          dropped = (await this.socket.emitPutdown()) ?? [];
+        } catch { /* ack timeout */ }
+        if (dropped.length === 0) console.log('[WARN] putdown dropped nothing (parcels expired?)');
+        beliefs.carried.clear();
+        return;
+      }
+
+      const arrived = await this.moveTo(target, nothingCarried);
+      if (!arrived && !nothingCarried()) {
+        await sleep(RETRY_PAUSE_MS);
+        if (++fails >= MAX_MOVE_FAILS) {
+          unreachable.add(target);
+          target = undefined;
+        }
+      }
+    }
+    console.log('[INFO] carried parcels vanished before delivery');
   }
 
-  deliver(){
+  async explore() {
+    const tile = chooseTileToExplore(this.beliefs);
+    if (!tile) {
+      await sleep(IDLE_PAUSE_MS);
+      return;
+    }
 
-  }
-
-  pickUpParcel(){
-      
+    // stop as soon as a parcel worth collecting is sensed, and decide again
+    const parcelFound = () => this.bestParcelToCollect() !== undefined;
+    const arrived = await this.moveTo(tile, parcelFound);
+    if (!arrived && !parcelFound()) {
+      tile.unreachableUntil = Date.now() + UNREACHABLE_COOLDOWN_MS;
+      await sleep(RETRY_PAUSE_MS);
+    }
   }
 }

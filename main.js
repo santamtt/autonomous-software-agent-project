@@ -1,7 +1,4 @@
-import { Agent } from './src/agent.js'
-import * as dist from './src/distance.js'
+import 'dotenv/config';
+import { Agent } from './src/agent.js';
 
-
-// Start the loop once connected
-let dd = new Agent();
-dd.runAgentLoop()
+new Agent().run();
